@@ -1400,9 +1400,10 @@ Expected: prints the `[broker] listening...` log lines and `{"ok":true}`. (If `d
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NODE_BIN="$(command -v node)"
+NODE_BIN="$(command -v node || true)"  # `|| true`: under set -e, a bare command -v miss would exit before our message
 PORT="${PORT:-8787}"
 LABEL="local.claw-broker"
+DOMAIN="gui/$(id -u)"
 LOG_DIR="${HOME}/Library/Logs/claw-broker"
 PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
@@ -1432,8 +1433,8 @@ sed \
   > "${PLIST_DEST}"
 
 echo "==> (Re)loading launchd service ${LABEL}"
-launchctl unload "${PLIST_DEST}" 2>/dev/null || true
-launchctl load "${PLIST_DEST}"
+launchctl bootout "${DOMAIN}" "${PLIST_DEST}" 2>/dev/null || true   # modern unload; ok if not loaded
+launchctl bootstrap "${DOMAIN}" "${PLIST_DEST}"                     # modern load
 
 echo "==> Waiting for health check on http://127.0.0.1:${PORT}/health"
 for attempt in $(seq 1 20); do
@@ -1481,8 +1482,22 @@ if [[ -z "${TS}" ]]; then
   exit 1
 fi
 
+# Preflight: must be logged in. (`serve` has no --yes; cert provisioning needs
+# HTTPS enabled in the admin console, which we cannot toggle from here.)
+if ! "${TS}" status >/dev/null 2>&1; then
+  echo "error: tailscale is not logged in / not running. Run: ${TS} up" >&2
+  exit 1
+fi
+
 echo "==> Proxying https://<machine>.<tailnet>.ts.net:${HTTPS_PORT}  ->  http://127.0.0.1:${PORT}"
-"${TS}" serve --bg --https="${HTTPS_PORT}" "http://127.0.0.1:${PORT}"
+# --bg returns promptly; capture failure (the usual cause is HTTPS not enabled).
+if ! "${TS}" serve --bg --https="${HTTPS_PORT}" "http://127.0.0.1:${PORT}"; then
+  echo "error: 'tailscale serve' failed." >&2
+  echo "  Most likely HTTPS certificates are not enabled for this tailnet." >&2
+  echo "  Enable them in the admin console (DNS -> Enable HTTPS), then re-run." >&2
+  echo "  Docs: https://tailscale.com/kb/1153/enabling-https" >&2
+  exit 1
+fi
 
 echo "==> Current serve config:"
 "${TS}" serve status
@@ -1501,11 +1516,12 @@ echo "To stop: ${TS} serve --https=${HTTPS_PORT} off"
 set -euo pipefail
 
 LABEL="local.claw-broker"
+DOMAIN="gui/$(id -u)"
 PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
 if [[ -f "${PLIST_DEST}" ]]; then
-  echo "==> Unloading ${LABEL}"
-  launchctl unload "${PLIST_DEST}" 2>/dev/null || true
+  echo "==> Booting out ${LABEL}"
+  launchctl bootout "${DOMAIN}" "${PLIST_DEST}" 2>/dev/null || true
   rm -f "${PLIST_DEST}"
   echo "==> Removed ${PLIST_DEST}"
 else
@@ -1659,10 +1675,12 @@ bring-up doc):
    serve it on :443, and point the daemon at the broker:
 
    ```bash
-   # frontend build (in the clawkie-talkie repo)
-   VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run build
+   # frontend build (in the clawkie-talkie repo) — note the ICE override (see below)
+   VITE_ICE_SERVERS_JSON='[]' \
+     VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run build
    # daemon
-   CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run daemon
+   CT_ICE_SERVERS_JSON='[]' \
+     CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run daemon
    ```
 
 2. **An edit to the OpenClaw handoff skill.** `clawkie-voice-handoff/SKILL.md`
@@ -1674,11 +1692,22 @@ bring-up doc):
 See `docs/superpowers/specs/2026-05-25-clawkie-talkie-bringup.md` for the exact
 steps and the end-to-end verification.
 
-### TURN is almost certainly unnecessary
+### TURN: you don't run one — but you must drop Rambly's
 
-Tailscale already provides direct connectivity between your phone and the Mac
-mini, so WebRTC host/STUN candidates over the tailnet should connect without a
-relay. No coturn is needed for this setup.
+You do **not** need to run coturn: Tailscale already provides direct
+connectivity between the phone and the Mac mini, so WebRTC host candidates over
+the tailnet connect without a relay.
+
+But self-hosting signaling does **not** by itself remove the dependency on
+Rambly. The clawkie-talkie defaults still set ICE to Google STUN +
+`turn:api.rambly.app:3478` unless you override them (verified at
+`clawkie-talkie@75398eb`: `client/src/rtc/client.ts:41`, `daemon/src/peer.ts:41`).
+So if the goal is "no hosted Rambly dependency," you must set **both**
+`VITE_ICE_SERVERS_JSON` and `CT_ICE_SERVERS_JSON` explicitly:
+
+- `'[]'` — pure tailnet, no external STUN/TURN (host candidates only). Preferred.
+- STUN-only, e.g. `'[{"urls":"stun:stun.l.google.com:19302"}]'` — fallback if
+  `[]` fails to connect (depends on Google STUN, still not Rambly).
 
 ## Manual end-to-end smoke test
 
@@ -1691,6 +1720,17 @@ After the broker is up and a frontend build + daemon are pointed at it:
 4. SDP/ICE exchange completes; the WebRTC connection reaches `connected`.
 5. Kill the broker process — audio is **not** disrupted, confirming the broker
    is not in the media path.
+
+### "No hosted Rambly dependency" check
+
+Run alongside the above to catch the silent-fallback failure mode:
+
+- The built frontend bundle contains your `…ts.net:8443` URL and **no**
+  `api.rambly.app` (`grep -r api.rambly.app client/dist` → no hits).
+- Daemon logs/flags show `CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443`.
+- ICE config is `[]` or STUN-only on both sides (no `turn:api.rambly.app`).
+- The phone browser's network panel shows **zero** requests to `api.rambly.app`
+  (signaling and ICE both stay self-hosted/tailnet).
 
 ## Configuration
 

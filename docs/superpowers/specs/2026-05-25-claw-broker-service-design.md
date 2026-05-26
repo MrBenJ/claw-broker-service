@@ -68,10 +68,13 @@ and the runbook; only the broker is built in this repo:
    daemon's separate `/dashboard` URL builder). The skill must be edited to emit
    the self-hosted frontend origin, or "switch to voice" never touches this
    broker. Out of scope for this repo; specified in the bring-up doc.
-4. **TURN is almost certainly unnecessary.** Tailscale already provides direct
-   connectivity between phone and Mac mini, so WebRTC host/STUN candidates over
-   the tailnet should connect without a relay. The spec also puts TURN out of
-   scope for the broker. No coturn here.
+4. **You don't run TURN — but you must drop Rambly's.** Tailscale provides
+   direct connectivity, so no coturn is needed (host candidates connect over the
+   tailnet). However, the clawkie-talkie defaults still point ICE at
+   `turn:api.rambly.app:3478` unless overridden (`client/src/rtc/client.ts:41`,
+   `daemon/src/peer.ts:41`), so self-hosting signaling alone does **not** remove
+   the Rambly dependency. The bring-up doc sets `VITE_ICE_SERVERS_JSON` /
+   `CT_ICE_SERVERS_JSON` to `[]` (or STUN-only). Out of scope for the broker.
 
 ## 4. Repository layout
 
@@ -262,13 +265,14 @@ close all SSE streams, stop accepting connections, exit.
   for `PORT` and `CT_SIGNALING_HOST`. `ProgramArguments` runs
   `node <repo>/dist/server.js` — compiled output, no `tsx` at runtime.
 - **`deploy/install.sh`** — `npm ci`, `npm run build` (tsc → `dist/`), copy the
-  plist to `~/Library/LaunchAgents/`, `launchctl unload` (if present) then
-  `launchctl load`, then **poll `curl -fsS /health`** and exit non-zero if it
-  never comes up. Idempotent.
-- **`deploy/uninstall.sh`** — `launchctl unload` + remove the plist. Idempotent.
-  The README also documents the bare `launchctl list` (status) /
-  `kickstart -k` (restart) / `bootout` (stop) commands so a remote bounce is
-  routine.
+  plist to `~/Library/LaunchAgents/`, modern `launchctl bootout` (if present)
+  then `launchctl bootstrap gui/$(id -u)`, then **poll `curl -fsS /health`** and
+  exit non-zero if it never comes up. Idempotent. (`command -v node` is guarded
+  with `|| true` so the friendly error runs under `set -e`.)
+- **`deploy/uninstall.sh`** — `launchctl bootout gui/$(id -u)` + remove the
+  plist. Idempotent. The README also documents the bare `launchctl list`
+  (status) / `kickstart -k` (restart) / `bootout` (stop) commands so a remote
+  bounce is routine.
 - **`deploy/tailscale-serve.sh`** — current-syntax (Tailscale ≥ 1.52)
   `tailscale serve --bg --https=8443 http://127.0.0.1:${PORT:-8787}`, exposing
   the broker as `https://<machine>.<tailnet>.ts.net:8443` on a dedicated port so

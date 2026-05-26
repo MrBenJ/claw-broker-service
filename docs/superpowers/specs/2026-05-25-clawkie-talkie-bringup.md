@@ -62,10 +62,16 @@ cross-origin from the frontend page — that is why broker CORS is `*`.
 In the `clawkie-talkie` repo on the Mac mini:
 
 ```bash
-VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run build
-# (ICE: usually omit — tailnet gives direct connectivity. If a relay proves
-#  necessary, also set VITE_ICE_SERVERS_JSON to your STUN/TURN.)
+VITE_ICE_SERVERS_JSON='[]' \
+  VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run build
 ```
+
+**Set `VITE_ICE_SERVERS_JSON` — do not omit it.** The frontend's default ICE is
+Google STUN + `turn:api.rambly.app:3478` (`client/src/rtc/client.ts:41` @
+`clawkie-talkie@75398eb`), so omitting the override leaves a silent dependency
+on Rambly's TURN even though signaling is self-hosted. Use `'[]'` for pure
+tailnet (host candidates only); fall back to STUN-only
+(`'[{"urls":"stun:stun.l.google.com:19302"}]'`) only if `[]` fails to connect.
 
 Serve the static build output on a loopback port (any static server is fine,
 e.g. `npx serve -l 127.0.0.1:5180 client/dist`). Note the `<fe-port>`.
@@ -93,7 +99,9 @@ In the daemon `.env` (or CLI flags):
 CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443
 CT_CLIENT_ORIGIN=https://<machine>.<tailnet>.ts.net   # keeps the daemon's own
                                                       # /dashboard URL on-origin
-# CT_ICE_SERVERS_JSON=...    # only if step 1 needed a relay
+CT_ICE_SERVERS_JSON='[]'   # REQUIRED to drop Rambly's TURN; daemon default is
+                           # Google STUN + turn:api.rambly.app:3478 (peer.ts:41).
+                           # Match whatever you chose for the frontend in step 1.
 ```
 
 ### 4. Edit the OpenClaw handoff skill origin
@@ -121,6 +129,9 @@ in effect.
    (`curl -s https://<machine>.<tailnet>.ts.net:8443/health` → `{"ok":true}` as a
    pre-check).
 4. SDP/ICE exchange completes; WebRTC reaches `connected`; audio flows both ways.
+   With the broker killed (next step) the call survives — but to prove there is
+   **no hosted Rambly dependency**, also confirm the phone's browser network
+   panel made **zero** requests to `api.rambly.app` during setup.
 5. Kill the broker (`launchctl bootout "gui/$(id -u)/local.claw-broker"`) — audio
    is **not** disrupted, confirming the broker is out of the media path.
 
@@ -129,6 +140,9 @@ in effect.
 - [ ] `curl -fsS https://<machine>.<tailnet>.ts.net:8443/health` → `{"ok":true}`
 - [ ] Frontend loads at `https://<machine>.<tailnet>.ts.net/voice` over valid HTTPS
 - [ ] `tailscale serve status` shows both :443 (frontend) and :8443 (broker)
-- [ ] Skill-emitted link uses the self-hosted origin
+- [ ] Skill-emitted link uses the self-hosted origin (not clawkietalkie.app)
 - [ ] Daemon stays connected across ≥1 heartbeat (30s) without reconnecting
 - [ ] WebRTC reaches `connected`; killing the broker mid-call doesn't drop audio
+- [ ] **No Rambly:** built bundle has no `api.rambly.app` (`grep -r api.rambly.app client/dist`),
+      ICE is `[]`/STUN-only on both sides, and the browser network panel shows no
+      `api.rambly.app` requests
