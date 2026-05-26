@@ -2,8 +2,8 @@
 
 **Status:** Approved (design phase)
 **Date:** 2026-05-25
-**Source spec:** `~/code/_forks/clawkie-talkie/docs/rambly-broker-spec.md` (the wire contract)
-**Reference implementation (tiebreaker for any ambiguity):** `clawkie-talkie/signaling/src/{app,server}.ts`
+**Source spec (wire contract):** `davidguttman/clawkie-talkie@75398eb` — `docs/rambly-broker-spec.md` (locally: `~/code/_forks/clawkie-talkie/docs/rambly-broker-spec.md`)
+**Reference implementation (tiebreaker for any ambiguity):** `davidguttman/clawkie-talkie@75398eb` — `signaling/src/{app,server}.ts`
 
 ## 1. Purpose
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node 20+ (developed on 22), TypeScript (ESM, NodeNext), vitest 4, tsx (dev), launchd + tailscale (deploy). No runtime dependencies.
 
-**Spec:** `docs/superpowers/specs/2026-05-25-claw-broker-service-design.md`. The wire contract's source of truth is `~/code/_forks/clawkie-talkie/signaling/src/app.ts`.
+**Spec:** `docs/superpowers/specs/2026-05-25-claw-broker-service-design.md`. The wire contract's source of truth is `davidguttman/clawkie-talkie@75398eb` — `signaling/src/app.ts` (locally, if cloned: `~/code/_forks/clawkie-talkie/signaling/src/app.ts`).
 
 **Conventions for every task:** ESM with `.js` import specifiers in `src/` (required for `node dist/server.js`; vitest resolves them to `.ts`). Commit after each task. Run the named test/command and confirm the stated expected output before checking a step off.
 
@@ -40,8 +40,10 @@ claw-broker-service/
 │   └── integration.test.ts
 ├── deploy/
 │   ├── local.claw-broker.plist   # launchd template (tokens substituted by install.sh)
-│   ├── install.sh                # build + render plist + load service
-│   └── tailscale-serve.sh        # front broker with HTTPS on the tailnet
+│   ├── install.sh                # build + render plist + bootstrap + health-check
+│   ├── uninstall.sh              # bootout + remove the launchd service (idempotent)
+│   └── tailscale-serve.sh        # front broker with HTTPS on :8443
+├── .env.example
 └── README.md
 ```
 
@@ -1350,7 +1352,19 @@ git commit -m "test: cover SSE announce, fan-out, heartbeat, and shutdown"
 
 - [ ] **Step 1: Verify the production build compiles and runs**
 
-Run: `npm run build && node dist/server.js & sleep 1 && curl -s http://127.0.0.1:8787/health && kill %1`
+Run (the parens ensure the server is only backgrounded *after* the build finishes — a bare `&` would race the build):
+
+```bash
+npm run build && (
+  node dist/server.js &
+  pid=$!
+  sleep 1
+  curl -fsS http://127.0.0.1:8787/health
+  kill "$pid"
+  wait "$pid" 2>/dev/null || true
+)
+```
+
 Expected: prints the `[broker] listening...` log lines and `{"ok":true}`. (If `dist/server.js` is missing, the build is misconfigured — check `tsconfig.build.json`.)
 
 - [ ] **Step 2: Write the launchd plist template**
