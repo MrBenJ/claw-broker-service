@@ -81,7 +81,7 @@ claw-broker-service/
 │   ├── rooms.test.ts        # announce / signal / lifecycle unit rules
 │   └── integration.test.ts  # boots real server on a loopback port, speaks SSE/POST over real HTTP
 ├── deploy/
-│   ├── studio.teknal.claw-broker.plist   # launchd user agent
+│   ├── local.claw-broker.plist           # launchd user agent
 │   ├── install.sh                        # build + install + load the launchd service
 │   └── tailscale-serve.sh                # front the broker with HTTPS on the tailnet
 ├── package.json   # zero runtime deps; dev: typescript, vitest, @types/node, tsx
@@ -247,7 +247,7 @@ close all SSE streams, stop accepting connections, exit.
 
 ## 9. Deploy kit
 
-- **`deploy/studio.teknal.claw-broker.plist`** — launchd user agent:
+- **`deploy/local.claw-broker.plist`** — launchd user agent:
   `RunAtLoad` + `KeepAlive` (restart on crash), `StandardOutPath` /
   `StandardErrorPath` to `~/Library/Logs/claw-broker/`, `EnvironmentVariables`
   for `PORT` and `CT_SIGNALING_HOST`. `ProgramArguments` runs
