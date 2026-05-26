@@ -64,7 +64,7 @@ claw-broker-service/
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx src/server.ts",
+    "dev": "tsx --env-file-if-exists=.env src/server.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -331,8 +331,12 @@ describe('validateSignalEnvelope', () => {
     const data = { type: 'offer', sdp: 'v=0' };
     expect(validateSignalEnvelope({ from: 'a', to: 'b', data }, 128)).toEqual({ from: 'a', to: 'b', data });
   });
-  it.each([null, 'hi', 42, []])('rejects non-object body %p', (body) => {
+  it.each([null, 'hi', 42])('rejects non-object body %p', (body) => {
     expect(() => validateSignalEnvelope(body, 128)).toThrow('Signal body must be a JSON object');
+  });
+  it('treats an array as an object (matching the reference) and then fails on missing from', () => {
+    // typeof [] === 'object', so the reference falls through to the from-check.
+    expect(() => validateSignalEnvelope([], 128)).toThrow('Signal body missing from');
   });
   it('rejects a missing/empty from', () => {
     expect(() => validateSignalEnvelope({ to: 'b' }, 128)).toThrow('Signal body missing from');
@@ -388,7 +392,9 @@ export function validatePeerAndRoom(
 }
 
 export function validateSignalEnvelope(value: unknown, maxIdLength: number): SignalEnvelope {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  // Mirror the reference exactly: typeof null/string/number !== 'object', but
+  // arrays ARE objects and fall through to the from/to checks below.
+  if (!value || typeof value !== 'object') {
     throw new Error('Signal body must be a JSON object');
   }
   const body = value as { from?: unknown; to?: unknown; data?: unknown };
@@ -406,7 +412,7 @@ export function validateSignalEnvelope(value: unknown, maxIdLength: number): Sig
 }
 ```
 
-> Note: the reference accepts arrays as "objects" (`typeof [] === 'object'`), but an array signal envelope has no string `from`, so it already fails with `Signal body missing from`. We reject arrays explicitly at the object check for a clearer message; the envelope-shape contract is unchanged (arrays are still rejected with a 400).
+> Note: we match the reference's exact edge-case behavior — an array body passes the `typeof value === 'object'` check and is then rejected with `Signal body missing from` (not `Signal body must be a JSON object`). The spec designates the reference as the source of truth for ambiguity, so we do not "improve" this message.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1153,8 +1159,12 @@ git commit -m "feat: add routing and server bootstrap"
 
 ```ts
 // test/helpers/sseClient.ts
-// Drives a real /subscribe SSE stream over HTTP. Adapted from the
-// clawkie-talkie reference test harness (test/customSignalingServer.test.ts).
+// Drives a real /subscribe SSE stream over HTTP. Vendored from the
+// clawkie-talkie reference test harness to keep this suite self-contained
+// (no dependency on the upstream repo) while preserving wire parity.
+//   upstream: davidguttman/clawkie-talkie @ 75398eb
+//   file:     test/customSignalingServer.test.ts
+// If you change the wire format, diff against that file/commit.
 import { expect } from 'vitest';
 
 export interface SseStream {
@@ -1336,7 +1346,7 @@ git commit -m "test: cover SSE announce, fan-out, heartbeat, and shutdown"
 ## Task 7: Build verification + deploy kit
 
 **Files:**
-- Create: `deploy/local.claw-broker.plist`, `deploy/install.sh`, `deploy/tailscale-serve.sh`
+- Create: `deploy/local.claw-broker.plist`, `deploy/install.sh`, `deploy/uninstall.sh`, `deploy/tailscale-serve.sh`
 
 - [ ] **Step 1: Verify the production build compiles and runs**
 
@@ -1425,47 +1435,101 @@ echo "==> (Re)loading launchd service ${LABEL}"
 launchctl unload "${PLIST_DEST}" 2>/dev/null || true
 launchctl load "${PLIST_DEST}"
 
-echo "==> Done. Verify with:"
-echo "    launchctl list | grep ${LABEL}"
-echo "    curl -s http://127.0.0.1:${PORT}/health"
-echo "    tail -f ${LOG_DIR}/out.log"
+echo "==> Waiting for health check on http://127.0.0.1:${PORT}/health"
+for attempt in $(seq 1 20); do
+  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    echo "==> Healthy. Service ${LABEL} is up."
+    echo "    Status:  launchctl list | grep ${LABEL}"
+    echo "    Logs:    tail -f ${LOG_DIR}/out.log"
+    exit 0
+  fi
+  sleep 0.5
+done
+
+echo "error: service did not pass health check within ~10s." >&2
+echo "  Inspect: tail -n 50 ${LOG_DIR}/err.log" >&2
+exit 1
 ```
 
 - [ ] **Step 4: Write `deploy/tailscale-serve.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# Front the local broker with HTTPS on this machine's tailnet name.
-# Requires tailscale to be installed, logged in, and HTTPS enabled for the
-# tailnet (Tailscale admin console: DNS > HTTPS Certificates).
+# Front the local broker with HTTPS on this machine's tailnet name, on a
+# DEDICATED port (8443) so the frontend can own :443 (/). See the bring-up
+# doc for the full topology.
+#
+# Prerequisites:
+#   - Tailscale installed and logged in (`tailscale status` works).
+#   - HTTPS certificates enabled for the tailnet:
+#     admin console -> DNS -> "Enable HTTPS".
+#   - Syntax requires Tailscale >= 1.52 (current `serve` CLI).
 set -euo pipefail
 
-PORT="${PORT:-8787}"
+PORT="${PORT:-8787}"          # local broker (loopback)
+HTTPS_PORT="${HTTPS_PORT:-8443}"  # tailnet-facing HTTPS port for the broker
 
-if ! command -v tailscale >/dev/null 2>&1; then
-  echo "error: tailscale CLI not found" >&2
+# Resolve the tailscale CLI. On macOS the GUI app ships it at a non-PATH path.
+TS="$(command -v tailscale || true)"
+if [[ -z "${TS}" && -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
+  TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+fi
+if [[ -z "${TS}" ]]; then
+  echo "error: tailscale CLI not found." >&2
+  echo "  Install the macOS app from https://tailscale.com/download/mac and either" >&2
+  echo "  add it to PATH or run: /Applications/Tailscale.app/Contents/MacOS/Tailscale" >&2
   exit 1
 fi
 
-echo "==> Proxying https://<this-machine>.<tailnet>.ts.net  ->  http://127.0.0.1:${PORT}"
-# Newer Tailscale: 'tailscale serve --bg <target>'. If your version rejects
-# this form, try: tailscale serve --bg --https=443 http://127.0.0.1:${PORT}
-tailscale serve --bg "http://127.0.0.1:${PORT}"
+echo "==> Proxying https://<machine>.<tailnet>.ts.net:${HTTPS_PORT}  ->  http://127.0.0.1:${PORT}"
+"${TS}" serve --bg --https="${HTTPS_PORT}" "http://127.0.0.1:${PORT}"
 
 echo "==> Current serve config:"
-tailscale serve status
+"${TS}" serve status
 
 echo
-echo "Use that https URL as VITE_SIGNAL_SERVER (frontend build) and"
-echo "CT_SIGNAL_SERVER (daemon)."
+echo "Broker URL = https://<machine>.<tailnet>.ts.net:${HTTPS_PORT}"
+echo "Use it as VITE_SIGNAL_SERVER (frontend build) and CT_SIGNAL_SERVER (daemon)."
+echo "To stop: ${TS} serve --https=${HTTPS_PORT} off"
 ```
 
-- [ ] **Step 5: Make scripts executable and lint them**
+- [ ] **Step 5: Write `deploy/uninstall.sh`** (so a remote bounce/teardown is boring)
 
-Run: `chmod +x deploy/install.sh deploy/tailscale-serve.sh && bash -n deploy/install.sh && bash -n deploy/tailscale-serve.sh && plutil -lint deploy/local.claw-broker.plist`
+```bash
+#!/usr/bin/env bash
+# Stop and remove the broker launchd service. Idempotent.
+set -euo pipefail
+
+LABEL="local.claw-broker"
+PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+
+if [[ -f "${PLIST_DEST}" ]]; then
+  echo "==> Unloading ${LABEL}"
+  launchctl unload "${PLIST_DEST}" 2>/dev/null || true
+  rm -f "${PLIST_DEST}"
+  echo "==> Removed ${PLIST_DEST}"
+else
+  echo "==> ${LABEL} not installed (no plist at ${PLIST_DEST})"
+fi
+
+echo "==> Done. Logs (if any) remain in ${HOME}/Library/Logs/claw-broker"
+echo "    Tailscale serve, if configured, is separate: tailscale serve --https=8443 off"
+```
+
+Status / restart (documented in the README; no script needed — these are the boring remote-bounce commands):
+
+```bash
+launchctl list | grep local.claw-broker                                   # status
+launchctl kickstart -k "gui/$(id -u)/local.claw-broker"                   # restart
+launchctl bootout "gui/$(id -u)/local.claw-broker" 2>/dev/null || true    # stop
+```
+
+- [ ] **Step 6: Make scripts executable and lint them**
+
+Run: `chmod +x deploy/install.sh deploy/uninstall.sh deploy/tailscale-serve.sh && for s in install uninstall tailscale-serve; do bash -n "deploy/$s.sh"; done && plutil -lint deploy/local.claw-broker.plist`
 Expected: no syntax errors from `bash -n`; `plutil` prints `deploy/local.claw-broker.plist: OK`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add deploy/
@@ -1532,7 +1596,7 @@ Full wire contract: `docs/superpowers/specs/2026-05-25-claw-broker-service-desig
 ```bash
 npm install
 npm test          # vitest: contract + integration suite
-npm run dev       # tsx src/server.ts (loads .env if present)
+npm run dev       # tsx --env-file-if-exists=.env src/server.ts (loads .env if present)
 npm run build     # tsc -> dist/
 npm start         # node dist/server.js
 ```
@@ -1542,50 +1606,73 @@ Requires Node 20+.
 ## Deploy on a Mac mini over tailnet
 
 This is the intended setup: the broker runs on the Mac mini (alongside
-OpenClaw), and your phone reaches it over your tailnet.
+OpenClaw), and your phone reaches it over your tailnet. The broker takes a
+**dedicated HTTPS port (8443)** so the clawkie-talkie frontend can own `/` on
+:443. (See `docs/superpowers/specs/2026-05-25-clawkie-talkie-bringup.md` for the
+full system bring-up: frontend, daemon, and the OpenClaw skill edit.)
 
 ```text
-phone (tailnet) ──HTTPS──► tailscale serve (<machine>.<tailnet>.ts.net:443)
-                                   └─ proxies ─► broker http://127.0.0.1:8787
+phone (tailnet) ──HTTPS :443──► tailscale serve ─► frontend  http://127.0.0.1:<fe-port>   (/voice)
+phone (tailnet) ──HTTPS :8443─► tailscale serve ─► broker    http://127.0.0.1:8787        (/subscribe,/signal,/health)
+                          (same <machine>.<tailnet>.ts.net cert; broker is cross-origin, CORS *)
 ```
 
 1. **Install + start the service** (builds, installs a launchd user agent that
-   auto-starts and restarts on crash):
+   auto-starts, restarts on crash, and self-checks health):
 
    ```bash
-   ./deploy/install.sh
+   ./deploy/install.sh          # exits non-zero if /health never comes up
    launchctl list | grep local.claw-broker
-   curl -s http://127.0.0.1:8787/health   # {"ok":true}
    ```
 
    Logs: `~/Library/Logs/claw-broker/{out,err}.log`.
+   Restart: `launchctl kickstart -k "gui/$(id -u)/local.claw-broker"`.
+   Remove: `./deploy/uninstall.sh`.
 
 2. **Expose it over HTTPS on the tailnet.** The broker binds `127.0.0.1`;
-   `tailscale serve` gives it a real HTTPS cert on your MagicDNS name:
+   `tailscale serve` gives it a real HTTPS cert on your MagicDNS name (port
+   8443):
 
    ```bash
    ./deploy/tailscale-serve.sh
-   tailscale serve status   # shows https://<machine>.<tailnet>.ts.net
+   tailscale serve status   # shows https://<machine>.<tailnet>.ts.net:8443
    ```
 
    HTTPS is required, not optional: phone browsers only grant microphone access
-   in a **secure context** (HTTPS or localhost), and SSE will not load from an
-   HTTPS page over plain HTTP (mixed content). `tailscale serve` solves both.
+   in a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts)
+   (HTTPS or localhost), and SSE will not load from an HTTPS page over plain
+   HTTP (mixed content). `tailscale serve` solves both with a valid cert.
 
-### You also need a matching frontend build
+   Tailscale must be installed, logged in, and have HTTPS certificates enabled
+   (admin console → DNS → Enable HTTPS). On macOS the CLI ships inside the app
+   at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; the script falls
+   back to that path if `tailscale` is not on `PATH`. Requires Tailscale ≥ 1.52.
 
-The hosted `clawkietalkie.app` is built to point at `api.rambly.app` and can
-**never** reach your broker — `VITE_SIGNAL_SERVER` is baked in at build time. To
-use this broker, build the clawkie-talkie frontend against it and point the
-daemon at it:
+### The broker alone is not a working handoff
 
-```bash
-# frontend build (in the clawkie-talkie repo)
-VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net npm run build
+Two more pieces are required, both **outside this repo** (specified in the
+bring-up doc):
 
-# daemon
-CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net npm run daemon
-```
+1. **A custom frontend build.** The hosted `clawkietalkie.app` bakes
+   `VITE_SIGNAL_SERVER=https://api.rambly.app` at build time and can **never**
+   reach your broker. Build the clawkie-talkie frontend against your broker and
+   serve it on :443, and point the daemon at the broker:
+
+   ```bash
+   # frontend build (in the clawkie-talkie repo)
+   VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run build
+   # daemon
+   CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443 npm run daemon
+   ```
+
+2. **An edit to the OpenClaw handoff skill.** `clawkie-voice-handoff/SKILL.md`
+   hardcodes `https://clawkietalkie.app/voice#…` (it is *not* driven by
+   `CT_CLIENT_ORIGIN`). Until that origin is changed to your frontend's
+   `https://<machine>.<tailnet>.ts.net/voice`, "switch to voice" links keep
+   pointing at the hosted stack and never touch your broker.
+
+See `docs/superpowers/specs/2026-05-25-clawkie-talkie-bringup.md` for the exact
+steps and the end-to-end verification.
 
 ### TURN is almost certainly unnecessary
 
@@ -1621,10 +1708,29 @@ All optional; defaults are the rambly contract. See `.env.example`.
 
 ## Security
 
-Peer IDs and room names are bearer routing material — anyone who knows a room
-can signal into it. The tailnet is the security boundary here; do not expose the
-broker to the public internet without TLS, rate limiting, and abuse controls.
-The broker does not log envelope bodies.
+- **Tailnet-only by design.** This broker has no auth — that is acceptable
+  *only* because the tailnet is the trust boundary. **Do not use Tailscale
+  Funnel** and do not otherwise expose it to the public internet. `tailscale
+  serve` is tailnet-private; Funnel is public — they are different features.
+- **Bearer routing material.** Peer IDs, room names, host, and session IDs are
+  secrets: anyone who knows a room can signal into it. Generate them with
+  enough entropy (UUID v4).
+- **CORS is `*` (threat model).** This matches Rambly so arbitrary frontend
+  origins work. The consequence: any web page open on a tailnet-connected phone
+  can issue requests to the broker URL. That is tolerable on a private tailnet;
+  if you later serve frontend and broker from one origin, consider narrowing
+  CORS.
+- **Log redaction.** The broker does not log request bodies. Keep it that way,
+  and also do not log routing identifiers (room, host, session) or any SDP/ICE
+  — these reveal who is talking and expose network topology.
+
+## References
+
+- MDN — [Using Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events) (event/data framing, keepalives)
+- MDN — [`getUserMedia` secure-context requirement](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)
+- MDN — [Secure contexts](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts) (the localhost exception)
+- Tailscale — [Serve overview](https://tailscale.com/docs/features/tailscale-serve) and [`serve` CLI](https://tailscale.com/docs/reference/tailscale-cli/serve)
+- Wire contract source of truth: `davidguttman/clawkie-talkie@75398eb` — `signaling/src/app.ts`
 ````
 
 - [ ] **Step 3: Final full verification**

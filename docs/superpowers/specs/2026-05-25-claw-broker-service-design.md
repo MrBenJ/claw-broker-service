@@ -38,15 +38,18 @@ phone browser ◄═══════ WebRTC media (P2P over tailnet) ═══
 The broker code stays simple (plain HTTP, binds `127.0.0.1`). HTTPS and reach
 are handled by the tailscale layer.
 
+The broker takes a **dedicated HTTPS port (8443)** via `tailscale serve` so the
+frontend can own `/` on :443. Same MagicDNS cert covers both ports; the browser
+calls the broker cross-origin (hence CORS `*`).
+
 ```text
-phone (on tailnet) ──HTTPS──► tailscale serve (<machine>.<tailnet>.ts.net:443)
-                                        │ proxies to
-                                        ▼
-                              broker  http://127.0.0.1:8787
+phone (tailnet) ──HTTPS :443 ──► tailscale serve ─► frontend http://127.0.0.1:<fe>   (/voice)
+phone (tailnet) ──HTTPS :8443──► tailscale serve ─► broker   http://127.0.0.1:8787   (/subscribe,/signal,/health)
 ```
 
-Three setup facts that determine whether the end-to-end actually works. They
-are **documented in the runbook**, not all built in this repo:
+Four setup facts that determine whether the end-to-end actually works. They are
+**specified in the companion bring-up doc** (`2026-05-25-clawkie-talkie-bringup.md`)
+and the runbook; only the broker is built in this repo:
 
 1. **Microphone requires a secure context.** Browsers only allow
    `getUserMedia` over HTTPS or `localhost`. A phone hitting a plain
@@ -58,9 +61,14 @@ are **documented in the runbook**, not all built in this repo:
 2. **The frontend is configured at build time** (`VITE_SIGNAL_SERVER`). The
    hosted `clawkietalkie.app` is baked to `api.rambly.app` and can never reach
    a custom broker. Using this broker requires a self-built frontend pointed at
-   `https://<machine>.<tailnet>.ts.net`. Out of scope for this repo; called out
-   in the runbook.
-3. **TURN is almost certainly unnecessary.** Tailscale already provides direct
+   `https://<machine>.<tailnet>.ts.net:8443`. Out of scope for this repo.
+3. **The OpenClaw handoff skill hardcodes the frontend origin.**
+   `clawkie-voice-handoff/SKILL.md` emits `https://clawkietalkie.app/voice#…`
+   and is **not** overridable by `CT_CLIENT_ORIGIN` (that env var only feeds the
+   daemon's separate `/dashboard` URL builder). The skill must be edited to emit
+   the self-hosted frontend origin, or "switch to voice" never touches this
+   broker. Out of scope for this repo; specified in the bring-up doc.
+4. **TURN is almost certainly unnecessary.** Tailscale already provides direct
    connectivity between phone and Mac mini, so WebRTC host/STUN candidates over
    the tailnet should connect without a relay. The spec also puts TURN out of
    scope for the broker. No coturn here.
@@ -82,8 +90,9 @@ claw-broker-service/
 │   └── integration.test.ts  # boots real server on a loopback port, speaks SSE/POST over real HTTP
 ├── deploy/
 │   ├── local.claw-broker.plist           # launchd user agent
-│   ├── install.sh                        # build + install + load the launchd service
-│   └── tailscale-serve.sh                # front the broker with HTTPS on the tailnet
+│   ├── install.sh                        # build + install + load + health-check the service
+│   ├── uninstall.sh                      # stop + remove the launchd service (idempotent)
+│   └── tailscale-serve.sh                # front the broker with HTTPS on :8443
 ├── package.json   # zero runtime deps; dev: typescript, vitest, @types/node, tsx
 ├── tsconfig.json
 └── README.md      # runbook (install, manual e2e), frontend-build note, no-TURN note
@@ -254,13 +263,22 @@ close all SSE streams, stop accepting connections, exit.
   `node <repo>/dist/server.js` — compiled output, no `tsx` at runtime.
 - **`deploy/install.sh`** — `npm ci`, `npm run build` (tsc → `dist/`), copy the
   plist to `~/Library/LaunchAgents/`, `launchctl unload` (if present) then
-  `launchctl load`. Idempotent.
-- **`deploy/tailscale-serve.sh`** — `tailscale serve --bg https / http://127.0.0.1:${PORT:-8787}`,
-  exposing the broker as `https://<machine>.<tailnet>.ts.net`. Prints the
-  resulting URL to use as `VITE_SIGNAL_SERVER` / `CT_SIGNAL_SERVER`.
-- **`README.md`** — install steps; how to point a frontend build and the daemon
-  at the broker; the manual end-to-end smoke checklist (below); the
-  frontend-build and no-TURN notes from §3.
+  `launchctl load`, then **poll `curl -fsS /health`** and exit non-zero if it
+  never comes up. Idempotent.
+- **`deploy/uninstall.sh`** — `launchctl unload` + remove the plist. Idempotent.
+  The README also documents the bare `launchctl list` (status) /
+  `kickstart -k` (restart) / `bootout` (stop) commands so a remote bounce is
+  routine.
+- **`deploy/tailscale-serve.sh`** — current-syntax (Tailscale ≥ 1.52)
+  `tailscale serve --bg --https=8443 http://127.0.0.1:${PORT:-8787}`, exposing
+  the broker as `https://<machine>.<tailnet>.ts.net:8443` on a dedicated port so
+  the frontend keeps `/` on :443. Resolves the tailscale CLI from `PATH` or the
+  macOS app path (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`) and
+  fails with install guidance if absent. Prints the broker URL to use as
+  `VITE_SIGNAL_SERVER` / `CT_SIGNAL_SERVER`.
+- **`README.md`** — install steps; the security/threat-model and log-redaction
+  notes (§11); the manual end-to-end smoke checklist (below); pointers to the
+  bring-up doc for the frontend/skill pieces; references.
 
 ## 10. Testing
 
@@ -288,28 +306,57 @@ arrives within a short window (test runs with `CT_PING_INTERVAL_MS` set low).
 No dependency on the clawkie-talkie repo.
 
 ### Manual end-to-end (runbook checklist, spec §9.2)
-1. Daemon (`CT_SIGNAL_SERVER=https://<machine>.ts.net`) connects and stays
-   connected through ≥1 heartbeat without reconnecting.
-2. Browser (custom build, `VITE_SIGNAL_SERVER=https://<machine>.ts.net`) joins
-   the room from the daemon's Join URL.
+1. Daemon (`CT_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443`) connects
+   and stays connected through ≥1 heartbeat without reconnecting.
+2. Browser (custom build, `VITE_SIGNAL_SERVER=https://<machine>.<tailnet>.ts.net:8443`)
+   joins the room from the (skill-emitted, self-hosted-origin) Join URL.
 3. Daemon receives `announce` for the browser's peer ID.
 4. SDP/ICE exchange completes; WebRTC reaches `connected`.
 5. Kill the broker process — audio is **not** disrupted (broker is not in the
    media path).
 
-## 11. Out of scope (spec §7)
+## 11. Security & threat model
+
+- **Tailnet-only by design.** No auth is acceptable *only* because the tailnet
+  is the trust boundary. **Do not use Tailscale Funnel** and do not otherwise
+  expose the broker publicly. `tailscale serve` is tailnet-private; Funnel is
+  the public-internet feature — keep them distinct.
+- **Bearer routing material.** Peer IDs, room names, host, and session IDs are
+  secrets (anyone who knows a room can signal into it). Use high-entropy values
+  (UUID v4).
+- **CORS `*` consequence.** Matches Rambly so arbitrary frontend origins work;
+  the cost is that any page open on a tailnet-connected phone can call the
+  broker URL. Acceptable on a private tailnet. If frontend and broker later
+  share one origin, narrowing CORS becomes an option.
+- **Log redaction.** The broker logs no request bodies; it must also never log
+  routing identifiers (room, host, session) or SDP/ICE, which reveal who is
+  talking and expose network topology.
+
+## 12. Out of scope (spec §7)
 
 Auth/API keys/JWT, room ownership/ACLs, persistence, message queueing /
 store-and-forward, media handling, TURN/STUN, clustering/shared-state. No
-interpretation of `data` (opaque JSON). Frontend build and coturn are separate
-concerns, referenced in the runbook but not built here.
+interpretation of `data` (opaque JSON). The frontend build, the OpenClaw
+handoff-skill edit, and coturn are separate concerns — specified in the
+companion bring-up doc (`2026-05-25-clawkie-talkie-bringup.md`), not built here.
 
-## 12. Build / tooling
+## 13. Build / tooling
 
 - TypeScript → `dist/` via `tsc` (`npm run build`). Service runs `node dist/server.js`.
-- `npm run dev` runs `tsx src/server.js` for local iteration.
+- `npm run dev` runs `tsx --env-file-if-exists=.env src/server.ts` for local
+  iteration (tsx does **not** auto-load `.env`; the flag is required).
 - `npm test` runs vitest.
 - Target Node 20+ (global `fetch` + `ReadableStream` for the integration test;
-  `node:http` for the server).
+  `node:http` for the server; `--env-file-if-exists` needs ≥ 20.12).
 - Zero runtime dependencies. Dev deps only: `typescript`, `vitest`,
   `@types/node`, `tsx`.
+
+## 14. References
+
+- Wire contract source of truth: `davidguttman/clawkie-talkie@75398eb` —
+  `signaling/src/app.ts` (impl), `test/customSignalingServer.test.ts` (harness).
+- MDN — [Using Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events),
+  [`getUserMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia),
+  [Secure contexts](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts).
+- Tailscale — [Serve overview](https://tailscale.com/docs/features/tailscale-serve),
+  [`serve` CLI](https://tailscale.com/docs/reference/tailscale-cli/serve).
