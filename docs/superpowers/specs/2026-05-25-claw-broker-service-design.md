@@ -2,8 +2,9 @@
 
 **Status:** Approved (design phase)
 **Date:** 2026-05-25
-**Source spec (wire contract):** `davidguttman/clawkie-talkie@75398eb` — `docs/rambly-broker-spec.md` (locally: `~/code/_forks/clawkie-talkie/docs/rambly-broker-spec.md`)
-**Reference implementation (tiebreaker for any ambiguity):** `davidguttman/clawkie-talkie@75398eb` — `signaling/src/{app,server}.ts`
+**Source docs (public):** `davidguttman/clawkie-talkie@75398eb` — `docs/custom-stack.md` (describes the custom signaling stack / routes)
+**Reference implementation / wire-contract tiebreaker:** `davidguttman/clawkie-talkie@75398eb` — `signaling/src/{app,server}.ts`
+**Detailed spec used for this design:** `rambly-broker-spec.md`, provided locally at `~/code/_forks/clawkie-talkie/docs/` — **not** committed upstream (do not cite as a public path), reproduced in this design where it matters.
 
 ## 1. Purpose
 

@@ -43,7 +43,6 @@ claw-broker-service/
 │   ├── install.sh                # build + render plist + bootstrap + health-check
 │   ├── uninstall.sh              # bootout + remove the launchd service (idempotent)
 │   └── tailscale-serve.sh        # front broker with HTTPS on :8443
-├── .env.example
 └── README.md
 ```
 
