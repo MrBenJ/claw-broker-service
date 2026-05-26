@@ -1,0 +1,32 @@
+<!-- deploy/local.claw-broker.plist
+     Template. install.sh substitutes __REPO_DIR__, __NODE_BIN__, and __PORT__. -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.claw-broker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__REPO_DIR__/dist/server.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key>
+    <string>__PORT__</string>
+    <key>CT_SIGNALING_HOST</key>
+    <string>127.0.0.1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__REPO_DIR__/../claw-broker-logs/out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_DIR__/../claw-broker-logs/err.log</string>
+</dict>
+</plist>
