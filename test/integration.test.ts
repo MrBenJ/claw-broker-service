@@ -1,6 +1,8 @@
+import { once } from 'node:events';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Config } from '../src/config.js';
 import { start, type RunningServer } from '../src/server.js';
+import { noEvent, sendSignal, subscribe, type SseStream } from './helpers/sseClient.js';
 
 function testConfig(over: Partial<Config> = {}): Config {
   return {
@@ -112,5 +114,84 @@ describe('HTTP contract', () => {
     });
     expect(res.status).toBe(201);
     await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+});
+
+describe('SSE behavior', () => {
+  const openStreams: SseStream[] = [];
+  afterEach(() => {
+    for (const s of openStreams.splice(0)) s.controller.abort();
+  });
+
+  it('announces a joiner to existing peers in the same room only', async () => {
+    await boot();
+    const a = await subscribe(baseUrl, 'peer-a', 'room-a');
+    const b = await subscribe(baseUrl, 'peer-b', 'room-a');
+    const c = await subscribe(baseUrl, 'peer-c', 'room-b');
+    openStreams.push(a, b, c);
+
+    await expect(a.nextEvent()).resolves.toEqual({ event: 'announce', data: 'peer-b' });
+    await noEvent(b); // the joiner is announced to nobody, including itself
+    await noEvent(c); // different room
+  });
+
+  it('relays a signal only to the matching peer in the same room', async () => {
+    await boot();
+    const a = await subscribe(baseUrl, 'peer-a', 'room-a');
+    const b = await subscribe(baseUrl, 'peer-b', 'room-a');
+    const bElsewhere = await subscribe(baseUrl, 'peer-b', 'room-b');
+    openStreams.push(a, b, bElsewhere);
+    await a.nextEvent(); // consume the announce for peer-b
+
+    const envelope = { from: 'peer-a', to: 'peer-b', data: { type: 'offer', sdp: 'v=0' } };
+    const post = await sendSignal(baseUrl, 'room-a', envelope);
+    expect(post.status).toBe(201);
+
+    await expect(b.nextEvent()).resolves.toEqual({ event: 'signal', data: JSON.stringify(envelope) });
+    await noEvent(a);
+    await noEvent(bElsewhere);
+  });
+
+  it('delivers a signal to two connections sharing one peerId', async () => {
+    await boot();
+    const b1 = await subscribe(baseUrl, 'peer-b', 'room-a');
+    const b2 = await subscribe(baseUrl, 'peer-b', 'room-a');
+    openStreams.push(b1, b2);
+    await b1.nextEvent(); // b1 saw an announce when b2 joined
+
+    const envelope = { from: 'peer-a', to: 'peer-b', data: {} };
+    await sendSignal(baseUrl, 'room-a', envelope);
+    await expect(b1.nextEvent()).resolves.toEqual({ event: 'signal', data: JSON.stringify(envelope) });
+    await expect(b2.nextEvent()).resolves.toEqual({ event: 'signal', data: JSON.stringify(envelope) });
+  });
+
+  it('enforces the per-room subscriber cap with 429', async () => {
+    await boot({ maxSubscribersPerRoom: 1 });
+    const first = await subscribe(baseUrl, 'peer-a', 'room-a');
+    openStreams.push(first);
+    const capped = await fetch(`${baseUrl}/subscribe?id=peer-b&room=room-a`);
+    expect(capped.status).toBe(429);
+    await expect(capped.json()).resolves.toEqual({ error: 'Too many subscribers in room' });
+  });
+
+  it('emits periodic ping heartbeats', async () => {
+    await boot({ pingIntervalMs: 25 });
+    const a = await subscribe(baseUrl, 'peer-a', 'room-a');
+    openStreams.push(a);
+    const event = await a.nextEvent(250);
+    expect(event.event).toBe('ping');
+    expect(Number(event.data)).toBeGreaterThan(0);
+  });
+
+  it('closes open SSE streams on shutdown and zeroes the count', async () => {
+    await boot();
+    const a = await subscribe(baseUrl, 'peer-a', 'room-a');
+    openStreams.push(a);
+    expect(running.service.subscriberCount).toBe(1);
+
+    const closed = once(running.server, 'close');
+    await running.shutdown();
+    await closed;
+    expect(running.service.subscriberCount).toBe(0);
   });
 });
